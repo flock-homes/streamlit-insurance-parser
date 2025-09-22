@@ -27,18 +27,33 @@ st.set_page_config(
     layout="wide"
 )
 
-# Default field coordinates (you'll need to calibrate these)
+# Updated coordinates based on your document layout (at 300 DPI)
 DEFAULT_COORDINATES = {
-    'property_coverage': (430, 1150, 700, 1180),
-    'loss_of_rent': (430, 1208, 700, 1238),
-    'total': (353, 1547, 653, 1577),
-    'location_description': (150, 800, 700, 870)
+    'property_coverage': (645, 1725, 1050, 1770),    # Red box - $261,783.00
+    'loss_of_rent': (645, 1965, 1050, 2010),        # Green box - $22,800.00  
+    'total': (530, 2320, 830, 2365),                # Blue box - $945.59
+    'location_description': (225, 1200, 1050, 1290) # Yellow box - address area
 }
 
 class PDFExtractor:
-    def __init__(self, field_coordinates):
+    def __init__(self, field_coordinates, extraction_dpi=300):
         self.results = []
         self.field_coordinates = field_coordinates
+        self.extraction_dpi = extraction_dpi
+    
+    def scale_coordinates(self, coordinates, from_dpi, to_dpi):
+        """Scale coordinates from one DPI to another"""
+        if from_dpi == to_dpi:
+            return coordinates
+        
+        scale_factor = to_dpi / from_dpi
+        x1, y1, x2, y2 = coordinates
+        return (
+            int(x1 * scale_factor),
+            int(y1 * scale_factor), 
+            int(x2 * scale_factor),
+            int(y2 * scale_factor)
+        )
     
     def preprocess_image_pil(self, image_pil: Image.Image) -> Image.Image:
         """Preprocess image using PIL (fallback method)"""
@@ -48,13 +63,13 @@ class PDFExtractor:
             
             # Enhance contrast
             enhancer = ImageEnhance.Contrast(gray)
-            enhanced = enhancer.enhance(2.0)
+            enhanced = enhancer.enhance(1.5)
             
-            # Apply threshold (convert to binary)
-            threshold = 128
-            binary = enhanced.point(lambda p: 255 if p > threshold else 0, mode='1')
+            # Enhance sharpness
+            sharpness_enhancer = ImageEnhance.Sharpness(enhanced)
+            sharpened = sharpness_enhancer.enhance(2.0)
             
-            return binary.convert('L')
+            return sharpened
         except Exception as e:
             st.warning(f"PIL preprocessing failed: {e}")
             return image_pil.convert('L')
@@ -68,21 +83,12 @@ class PDFExtractor:
             else:
                 gray = image
             
-            # Apply thresholding
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Apply adaptive thresholding for better text detection
+            adaptive_thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            )
             
-            # Noise removal - use direct values instead of constants
-            kernel = np.ones((2, 2), np.uint8)
-            
-            # MORPH_OPENING = 2 (if constant not available)
-            try:
-                opening = cv2.morphologyEx(thresh, cv2.MORPH_OPENING, kernel, iterations=1)
-            except AttributeError:
-                # Fallback: opening = erosion followed by dilation
-                erosion = cv2.erode(thresh, kernel, iterations=1)
-                opening = cv2.dilate(erosion, kernel, iterations=1)
-            
-            return opening
+            return adaptive_thresh
         except Exception as e:
             st.warning(f"OpenCV preprocessing failed: {e}")
             return image
@@ -131,27 +137,38 @@ class PDFExtractor:
         
         # Configure OCR based on field type
         if any(keyword in field_name.lower() for keyword in ['coverage', 'rent', 'total']):
-            # For monetary amounts
-            config = '--psm 7 -c tessedit_char_whitelist=0123456789.,$'
-        else:
-            # For addresses and text
+            # For monetary amounts - more specific whitelist
+            config = '--psm 8 -c tessedit_char_whitelist=0123456789.,$'
+        elif 'location' in field_name.lower() or 'description' in field_name.lower():
+            # For addresses - allow more characters
             config = '--psm 6'
+        else:
+            # General text
+            config = '--psm 7'
         
         try:
             # Perform OCR
             text = pytesseract.image_to_string(processed_roi, config=config).strip()
             
-            # Clean up the text
+            # Clean up the text based on field type
             if any(keyword in field_name.lower() for keyword in ['coverage', 'rent', 'total']):
-                # Remove non-numeric characters except decimal points and commas
+                # For monetary amounts
+                # Remove everything except digits, decimal points, and commas
                 text = re.sub(r'[^\d.,]', '', text)
+                # Remove leading/trailing commas or dots
+                text = text.strip('.,')
                 # Handle multiple decimal points
-                if '.' in text:
+                if text.count('.') > 1:
                     parts = text.split('.')
-                    if len(parts) > 2:
-                        text = parts[0] + '.' + ''.join(parts[1:])
+                    text = '.'.join(parts[:2])  # Keep only first decimal point
+            elif 'location' in field_name.lower() or 'description' in field_name.lower():
+                # For location/description - clean up but preserve address format
+                # Remove excessive whitespace and line breaks
+                text = ' '.join(text.split())
+                # Remove common OCR artifacts
+                text = re.sub(r'[|_\\]', '', text)
             
-            return text if text else f"No text found in {field_name}"
+            return text if text else f"No text detected in {field_name}"
             
         except Exception as e:
             return f"OCR error in {field_name}: {str(e)}"
@@ -159,16 +176,16 @@ class PDFExtractor:
     def process_pdf(self, pdf_file) -> Dict[str, str]:
         """Process a single PDF file"""
         try:
-            # Convert PDF to images
+            # Convert PDF to images at extraction DPI
             if hasattr(pdf_file, 'read'):
                 # Streamlit uploaded file
                 pdf_bytes = pdf_file.read()
-                images = convert_from_bytes(pdf_bytes, dpi=300)
+                images = convert_from_bytes(pdf_bytes, dpi=self.extraction_dpi)
             else:
                 # File path
-                images = convert_from_path(pdf_file, dpi=300)
+                images = convert_from_path(pdf_file, dpi=self.extraction_dpi)
             
-            # Process first page (assuming single page documents)
+            # Process first page
             if not images:
                 return {"error": "No pages found in PDF"}
             
@@ -220,10 +237,23 @@ def get_field_coordinates_from_sidebar():
     coordinates = {}
     
     st.sidebar.title("⚙️ Field Coordinates")
+    st.sidebar.markdown("**Coordinates are for 300 DPI extraction**")
     st.sidebar.markdown("Adjust extraction coordinates for each field:")
     
+    # Show coordinate tips
+    with st.sidebar.expander("📏 Coordinate Tips", expanded=False):
+        st.markdown("""
+        **Based on your document:**
+        - Property Coverage: Around (645, 1725, 1050, 1770)
+        - Loss of Rent: Around (645, 1965, 1050, 2010)
+        - Total: Around (530, 2320, 830, 2365)  
+        - Location: Around (225, 1200, 1050, 1290)
+        
+        **Preview uses 200 DPI, extraction uses 300 DPI**
+        """)
+    
     # Property Coverage
-    with st.sidebar.expander("📊 Property Coverage", expanded=False):
+    with st.sidebar.expander("📊 Property Coverage", expanded=True):
         pc_x1 = st.number_input("X1 (left)", value=DEFAULT_COORDINATES['property_coverage'][0], key="pc_x1")
         pc_y1 = st.number_input("Y1 (top)", value=DEFAULT_COORDINATES['property_coverage'][1], key="pc_y1")
         pc_x2 = st.number_input("X2 (right)", value=DEFAULT_COORDINATES['property_coverage'][2], key="pc_x2")
@@ -258,14 +288,22 @@ def get_field_coordinates_from_sidebar():
     if st.sidebar.button("🔄 Reset to Defaults"):
         st.rerun()
     
-    # Save coordinates button
-    if st.sidebar.button("💾 Save Current Coordinates"):
-        st.sidebar.success("Coordinates saved for this session!")
-    
     return coordinates
 
-def draw_rectangles_safe(image_np, field_coordinates):
-    """Safely draw rectangles with fallback methods"""
+def draw_rectangles_safe(image_np, field_coordinates, preview_dpi=200):
+    """Safely draw rectangles with DPI scaling for preview"""
+    # Scale coordinates from 300 DPI (extraction) to preview DPI
+    scaled_coordinates = {}
+    for field_name, coords in field_coordinates.items():
+        x1, y1, x2, y2 = coords
+        scale_factor = preview_dpi / 300  # Scale from 300 DPI to preview DPI
+        scaled_coordinates[field_name] = (
+            int(x1 * scale_factor),
+            int(y1 * scale_factor),
+            int(x2 * scale_factor), 
+            int(y2 * scale_factor)
+        )
+    
     if cv2 is not None:
         try:
             # Use OpenCV
@@ -276,7 +314,7 @@ def draw_rectangles_safe(image_np, field_coordinates):
                 'location_description': (255, 255, 0)  # Yellow
             }
             
-            for field_name, (x1, y1, x2, y2) in field_coordinates.items():
+            for field_name, (x1, y1, x2, y2) in scaled_coordinates.items():
                 color = colors.get(field_name, (255, 0, 0))
                 cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 3)
                 
@@ -302,7 +340,7 @@ def draw_rectangles_safe(image_np, field_coordinates):
             'location_description': (255, 255, 0)  # Yellow
         }
         
-        for field_name, (x1, y1, x2, y2) in field_coordinates.items():
+        for field_name, (x1, y1, x2, y2) in scaled_coordinates.items():
             color = colors.get(field_name, (255, 0, 0))
             draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
             
@@ -332,11 +370,14 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 💡 Tips")
     st.sidebar.markdown("""
-    - Use the **Preview** tab to see extraction areas
-    - Adjust coordinates if boxes don't align with text
-    - X1,Y1 = top-left corner
-    - X2,Y2 = bottom-right corner
-    - Add 5-10 pixel buffer around text
+    - **Preview tab shows 200 DPI** (for speed)
+    - **Extraction uses 300 DPI** (for accuracy)
+    - Coordinates auto-scale between preview/extraction
+    - Look for the colored boxes in preview
+    - Property Coverage: Red box
+    - Loss of Rent: Green box  
+    - Total: Blue box
+    - Location: Yellow box
     """)
     
     # Main interface
@@ -355,7 +396,7 @@ def main():
             st.success(f"Uploaded {len(uploaded_files)} file(s)")
             
             # Show current coordinates
-            with st.expander("📐 Current Coordinates", expanded=False):
+            with st.expander("📐 Current Coordinates (300 DPI)", expanded=False):
                 coord_df = pd.DataFrame([
                     {"Field": "Property Coverage", "X1": field_coordinates['property_coverage'][0], 
                      "Y1": field_coordinates['property_coverage'][1], "X2": field_coordinates['property_coverage'][2], 
@@ -374,7 +415,7 @@ def main():
             
             # Extract button
             if st.button("🚀 Extract Data", type="primary"):
-                extractor = PDFExtractor(field_coordinates)
+                extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
                 
                 with st.spinner("Processing PDFs..."):
                     results_df = extractor.process_multiple_pdfs(uploaded_files)
@@ -398,6 +439,7 @@ def main():
     
     with tab2:
         st.header("🔍 Preview Extraction Areas")
+        st.info("Preview shows coordinates scaled to 200 DPI for faster loading")
         
         if uploaded_files:
             selected_file = st.selectbox("Select file to preview", uploaded_files, key="preview_file")
@@ -411,27 +453,35 @@ def main():
                 - 🟢 **Loss of Rent** 
                 - 🔵 **Total**
                 - 🟡 **Location/Description**
+                
+                **Current 300 DPI Coordinates:**
                 """)
+                
+                # Show scaled coordinates for 200 DPI preview
+                st.text(f"Property: {field_coordinates['property_coverage']}")
+                st.text(f"Loss Rent: {field_coordinates['loss_of_rent']}")  
+                st.text(f"Total: {field_coordinates['total']}")
+                st.text(f"Location: {field_coordinates['location_description']}")
             
             with col1:
                 if selected_file and st.button("👁️ Show Extraction Areas"):
                     try:
-                        # Convert first page to image
+                        # Convert first page to image at 200 DPI for preview
                         pdf_bytes = selected_file.read()
                         images = convert_from_bytes(pdf_bytes, dpi=200)
                         
                         if images:
                             image_np = np.array(images[0])
                             
-                            # Draw rectangles around extraction areas
-                            image_with_boxes = draw_rectangles_safe(image_np, field_coordinates)
+                            # Draw rectangles with DPI scaling
+                            image_with_boxes = draw_rectangles_safe(image_np, field_coordinates, preview_dpi=200)
                             
                             # Display image
-                            st.image(image_with_boxes, caption="Extraction Areas", use_column_width=True)
+                            st.image(image_with_boxes, caption="Extraction Areas (200 DPI Preview)", use_column_width=True)
                             
-                            # Show extracted values
+                            # Show extracted values using actual extraction coordinates
                             st.subheader("🔍 Extracted Values Preview")
-                            extractor = PDFExtractor(field_coordinates)
+                            extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
                             extracted = extractor.process_pdf(selected_file)
                             
                             if 'error' not in extracted:
@@ -442,6 +492,8 @@ def main():
                         
                     except Exception as e:
                         st.error(f"Error previewing file: {str(e)}")
+        else:
+            st.info("Upload a PDF file first to see the preview")
     
     with tab3:
         st.header("📊 Results Analysis")
@@ -469,11 +521,11 @@ def main():
                         if not pd.isna(avg_value):
                             st.metric(f"Average {field.replace('_', ' ').title()}", 
                                     f"${avg_value:,.2f}")
-                            break  # Show only one metric to fit space
+                            break
             
             with col3:
                 # Show data quality metrics
-                total_fields = len(df) * 4  # 4 fields per document
+                total_fields = len(df) * 4
                 empty_fields = 0
                 for field in ['property_coverage', 'loss_of_rent', 'total', 'location_description']:
                     if field in df.columns:
