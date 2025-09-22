@@ -166,46 +166,64 @@ class PDFExtractor:
             offset_coordinates[field_name] = (x1, y1 + y_offset, x2, y2 + y_offset)
         return offset_coordinates
     
-    def extract_with_fallback(self, image: np.ndarray, coordinates: Dict[str, Tuple[int, int, int, int]], filename: str) -> Dict[str, str]:
-        """Extract fields with automatic fallback using Y-offset"""
-        # First attempt with original coordinates
-        extracted_data = {"filename": filename}
-        
+    def extract_all_fields_with_coordinates(self, image: np.ndarray, coordinates: Dict[str, Tuple[int, int, int, int]]) -> Dict[str, str]:
+        """Extract all fields using given coordinates"""
+        results = {}
         for field_name, coords in coordinates.items():
             value = self.extract_field_value(image, coords, field_name)
-            extracted_data[field_name] = value
+            results[field_name] = value
+        return results
+    
+    def count_valid_extractions(self, extraction_results: Dict[str, str]) -> int:
+        """Count how many fields were successfully extracted"""
+        valid_count = 0
+        for field_name, value in extraction_results.items():
+            if self.is_valid_extraction(value, field_name):
+                valid_count += 1
+        return valid_count
+    
+    def extract_with_fallback(self, image: np.ndarray, coordinates: Dict[str, Tuple[int, int, int, int]], filename: str) -> Dict[str, str]:
+        """Extract fields with automatic fallback using Y-offset, choosing the method with most successful extractions"""
         
-        # Check if property coverage extraction failed
-        property_coverage = extracted_data.get('property_coverage', '')
+        # First attempt with original coordinates
+        original_results = self.extract_all_fields_with_coordinates(image, coordinates)
+        original_valid_count = self.count_valid_extractions(original_results)
+        
+        # Check if property coverage extraction failed (trigger for trying offset)
+        property_coverage = original_results.get('property_coverage', '')
+        
         if not self.is_valid_extraction(property_coverage, 'property_coverage'):
             st.info(f"🔄 Property coverage not found in {filename}, trying with Y+45 offset...")
             
             # Apply Y offset and try again
             offset_coordinates = self.apply_y_offset(coordinates, 45)
+            offset_results = self.extract_all_fields_with_coordinates(image, offset_coordinates)
+            offset_valid_count = self.count_valid_extractions(offset_results)
             
-            # Re-extract all fields with offset
-            for field_name, coords in offset_coordinates.items():
-                offset_value = self.extract_field_value(image, coords, field_name)
-                
-                # Use offset value if it's better than original
-                original_value = extracted_data[field_name]
-                if self.is_valid_extraction(offset_value, field_name) and not self.is_valid_extraction(original_value, field_name):
-                    extracted_data[field_name] = offset_value
-                    extracted_data[f"{field_name}_method"] = "Y+45_offset"
-                elif self.is_valid_extraction(original_value, field_name):
-                    extracted_data[f"{field_name}_method"] = "original"
-                else:
-                    # Keep original even if both failed, but mark the attempt
-                    extracted_data[f"{field_name}_method"] = "both_failed"
+            # Choose the method that yielded more successful extractions
+            if offset_valid_count > original_valid_count:
+                st.success(f"✅ Y+45 offset method yielded {offset_valid_count} vs {original_valid_count} successful extractions for {filename}")
+                final_results = offset_results.copy()
+                extraction_method = "Y+45_offset"
+            else:
+                st.info(f"📊 Original method still better: {original_valid_count} vs {offset_valid_count} successful extractions for {filename}")
+                final_results = original_results.copy()
+                extraction_method = "original"
         else:
-            # Mark successful extractions
-            for field_name in coordinates.keys():
-                if self.is_valid_extraction(extracted_data[field_name], field_name):
-                    extracted_data[f"{field_name}_method"] = "original"
-                else:
-                    extracted_data[f"{field_name}_method"] = "failed"
+            # Original method worked for property coverage
+            final_results = original_results.copy()
+            extraction_method = "original"
         
-        return extracted_data
+        # Add filename and overall extraction method
+        final_results['filename'] = filename
+        final_results['extraction_method'] = extraction_method
+        
+        # Add individual field success indicators
+        for field_name in coordinates.keys():
+            field_success = self.is_valid_extraction(final_results[field_name], field_name)
+            final_results[f"{field_name}_success"] = "✅" if field_success else "❌"
+        
+        return final_results
     
     def process_pdf_from_bytes(self, pdf_bytes: bytes, filename: str) -> Dict[str, str]:
         """Process PDF from bytes"""
@@ -290,12 +308,13 @@ class PDFExtractor:
         # Convert to DataFrame
         df = pd.DataFrame(results)
         
-        # Reorder columns - put method columns at the end
+        # Reorder columns - main fields first, then success indicators, then method info
         main_fields = ['filename', 'property_coverage', 'loss_of_rent', 'total', 'location_description']
-        method_fields = [col for col in df.columns if col.endswith('_method')]
-        other_fields = [col for col in df.columns if col not in main_fields and col not in method_fields]
+        success_fields = [col for col in df.columns if col.endswith('_success')]
+        method_fields = ['extraction_method']
+        other_fields = [col for col in df.columns if col not in main_fields and col not in success_fields and col not in method_fields]
         
-        column_order = main_fields + other_fields + method_fields
+        column_order = main_fields + success_fields + method_fields + other_fields
         existing_cols = [col for col in column_order if col in df.columns]
         df = df[existing_cols]
         
@@ -319,12 +338,13 @@ class PDFExtractor:
         # Convert to DataFrame
         df = pd.DataFrame(results)
         
-        # Reorder columns - put method columns at the end
+        # Reorder columns - main fields first, then success indicators, then method info
         main_fields = ['filename', 'property_coverage', 'loss_of_rent', 'total', 'location_description']
-        method_fields = [col for col in df.columns if col.endswith('_method')]
-        other_fields = [col for col in df.columns if col not in main_fields and col not in method_fields]
+        success_fields = [col for col in df.columns if col.endswith('_success')]
+        method_fields = ['extraction_method']
+        other_fields = [col for col in df.columns if col not in main_fields and col not in success_fields and col not in method_fields]
         
-        column_order = main_fields + other_fields + method_fields
+        column_order = main_fields + success_fields + method_fields + other_fields
         existing_cols = [col for col in column_order if col in df.columns]
         df = df[existing_cols]
         
@@ -347,7 +367,7 @@ def get_field_coordinates_from_sidebar():
         - Total: (530, 2320, 830, 2365)  
         - Location: (225, 1200, 1050, 1290)
         
-        **Auto-fallback:** If property coverage fails, tries Y+45 offset
+        **Smart fallback:** Uses method with most successful extractions
         """)
     
     # Property Coverage
@@ -463,11 +483,11 @@ def main():
     
     # Additional sidebar info
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 💡 Smart Extraction")
+    st.sidebar.markdown("### 🎯 Smart Extraction")
     st.sidebar.markdown("""
-    - **Auto Y-offset fallback** for layout variations
+    - **Best method selection** based on total success count
     - **Updated Loss of Rent coordinates** ✅
-    - **Validation checks** for better accuracy
+    - **Success indicators** for each field
     - Red: Property Coverage
     - Green: Loss of Rent  
     - Blue: Total
@@ -536,19 +556,17 @@ def main():
                     st.success("✅ Extraction completed!")
                     
                     # Show summary of extraction methods used
-                    if any(col.endswith('_method') for col in results_df.columns):
-                        method_summary = {}
-                        for col in results_df.columns:
-                            if col.endswith('_method'):
-                                method_counts = results_df[col].value_counts()
-                                field = col.replace('_method', '')
-                                method_summary[field] = method_counts
+                    if 'extraction_method' in results_df.columns:
+                        method_counts = results_df['extraction_method'].value_counts()
+                        st.subheader("📈 Extraction Method Summary")
                         
-                        if method_summary:
-                            st.subheader("📈 Extraction Method Summary")
-                            for field, counts in method_summary.items():
-                                if 'Y+45_offset' in counts:
-                                    st.info(f"🔄 {field.replace('_', ' ').title()}: {counts.get('Y+45_offset', 0)} files used Y+45 offset fallback")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if 'original' in method_counts:
+                                st.metric("Files using Original Coordinates", method_counts.get('original', 0))
+                        with col2:
+                            if 'Y+45_offset' in method_counts:
+                                st.metric("Files using Y+45 Offset", method_counts.get('Y+45_offset', 0))
                     
                     # Show preview
                     st.subheader("📋 Extraction Results")
@@ -609,19 +627,17 @@ def main():
                         st.success("✅ Extraction completed!")
                         
                         # Show summary of extraction methods used
-                        if any(col.endswith('_method') for col in results_df.columns):
-                            method_summary = {}
-                            for col in results_df.columns:
-                                if col.endswith('_method'):
-                                    method_counts = results_df[col].value_counts()
-                                    field = col.replace('_method', '')
-                                    method_summary[field] = method_counts
+                        if 'extraction_method' in results_df.columns:
+                            method_counts = results_df['extraction_method'].value_counts()
+                            st.subheader("📈 Extraction Method Summary")
                             
-                            if method_summary:
-                                st.subheader("📈 Extraction Method Summary")
-                                for field, counts in method_summary.items():
-                                    if 'Y+45_offset' in counts:
-                                        st.info(f"🔄 {field.replace('_', ' ').title()}: {counts.get('Y+45_offset', 0)} files used Y+45 offset fallback")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                if 'original' in method_counts:
+                                    st.metric("Files using Original Coordinates", method_counts.get('original', 0))
+                            with col2:
+                                if 'Y+45_offset' in method_counts:
+                                    st.metric("Files using Y+45 Offset", method_counts.get('Y+45_offset', 0))
                         
                         # Show preview
                         st.subheader("📋 Extraction Results")
@@ -713,18 +729,26 @@ def main():
                             extracted = extractor.process_pdf_from_bytes(pdf_bytes, selected_file.name)
                             
                             if 'error' not in extracted:
-                                # Separate main fields from method fields
-                                main_data = {k: v for k, v in extracted.items() if not k.endswith('_method')}
-                                method_data = {k: v for k, v in extracted.items() if k.endswith('_method')}
+                                # Separate main fields from success/method fields
+                                main_data = {k: v for k, v in extracted.items() if not k.endswith('_success') and k != 'extraction_method'}
                                 
                                 preview_df = pd.DataFrame([main_data])
                                 st.dataframe(preview_df, hide_index=True)
                                 
-                                # Show extraction methods if any fallbacks were used
-                                if method_data:
-                                    st.subheader("🔧 Extraction Methods Used")
-                                    method_df = pd.DataFrame([method_data])
-                                    st.dataframe(method_df, hide_index=True)
+                                # Show extraction info
+                                if 'extraction_method' in extracted:
+                                    method = extracted['extraction_method']
+                                    if method == 'Y+45_offset':
+                                        st.info(f"🔄 Used Y+45 offset method for this document")
+                                    else:
+                                        st.success(f"✅ Used original coordinates for this document")
+                                
+                                # Show success indicators
+                                success_data = {k: v for k, v in extracted.items() if k.endswith('_success')}
+                                if success_data:
+                                    st.subheader("🎯 Field Success Indicators")
+                                    success_df = pd.DataFrame([success_data])
+                                    st.dataframe(success_df, hide_index=True)
                             else:
                                 st.error(extracted['error'])
                         
@@ -756,12 +780,9 @@ def main():
                 error_count = df['error'].notna().sum() if 'error' in df.columns else 0
                 st.metric("Files with Errors", error_count)
                 
-                # Count files that used offset fallback
-                offset_count = 0
-                for col in df.columns:
-                    if col.endswith('_method'):
-                        offset_count += (df[col] == 'Y+45_offset').sum()
-                if offset_count > 0:
+                # Count files that used offset method
+                if 'extraction_method' in df.columns:
+                    offset_count = (df['extraction_method'] == 'Y+45_offset').sum()
                     st.metric("Files Using Y+45 Offset", offset_count)
             
             with col2:
@@ -778,18 +799,39 @@ def main():
                             break
             
             with col3:
-                # Show data quality metrics
-                main_fields = ['property_coverage', 'loss_of_rent', 'total', 'location_description']
-                total_fields = len(df) * len(main_fields)
-                empty_fields = 0
-                for field in main_fields:
-                    if field in df.columns:
-                        empty_fields += df[field].isna().sum() + (df[field] == '').sum()
-                        # Count extraction failures
-                        empty_fields += df[field].str.contains('No text|OCR error|Invalid|failed', na=False).sum()
-                
-                completion_rate = ((total_fields - empty_fields) / total_fields * 100) if total_fields > 0 else 0
-                st.metric("Data Completion Rate", f"{completion_rate:.1f}%")
+                # Show success rate metrics
+                success_fields = [col for col in df.columns if col.endswith('_success')]
+                if success_fields:
+                    total_extractions = len(df) * len([col for col in success_fields])
+                    successful_extractions = 0
+                    for col in success_fields:
+                        successful_extractions += (df[col] == '✅').sum()
+                    
+                    success_rate = (successful_extractions / total_extractions * 100) if total_extractions > 0 else 0
+                    st.metric("Field Success Rate", f"{success_rate:.1f}%")
+                else:
+                    # Fallback to old method
+                    main_fields = ['property_coverage', 'loss_of_rent', 'total', 'location_description']
+                    total_fields = len(df) * len(main_fields)
+                    empty_fields = 0
+                    for field in main_fields:
+                        if field in df.columns:
+                            empty_fields += df[field].isna().sum() + (df[field] == '').sum()
+                            empty_fields += df[field].str.contains('No text|OCR error|Invalid|failed', na=False).sum()
+                    
+                    completion_rate = ((total_fields - empty_fields) / total_fields * 100) if total_fields > 0 else 0
+                    st.metric("Data Completion Rate", f"{completion_rate:.1f}%")
+            
+            # Show extraction method breakdown
+            if 'extraction_method' in df.columns:
+                st.subheader("🔧 Extraction Method Breakdown")
+                method_counts = df['extraction_method'].value_counts()
+                method_df = pd.DataFrame({
+                    'Method': method_counts.index,
+                    'Count': method_counts.values,
+                    'Percentage': (method_counts.values / len(df) * 100).round(1)
+                })
+                st.dataframe(method_df, hide_index=True)
             
             # Show full results
             st.subheader("Full Results")
