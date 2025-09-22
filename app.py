@@ -1,13 +1,5 @@
 import streamlit as st
-try:
-    import cv2
-    # Test if cv2 is working properly
-    _ = cv2.MORPH_OPENING
-except (ImportError, AttributeError) as e:
-    st.error(f"OpenCV issue detected: {e}")
-    st.info("Using alternative image processing...")
-    cv2 = None
-
+import cv2
 import pytesseract
 from pdf2image import convert_from_path, convert_from_bytes
 import pandas as pd
@@ -41,22 +33,8 @@ class PDFExtractor:
         self.field_coordinates = field_coordinates
         self.extraction_dpi = extraction_dpi
     
-    def scale_coordinates(self, coordinates, from_dpi, to_dpi):
-        """Scale coordinates from one DPI to another"""
-        if from_dpi == to_dpi:
-            return coordinates
-        
-        scale_factor = to_dpi / from_dpi
-        x1, y1, x2, y2 = coordinates
-        return (
-            int(x1 * scale_factor),
-            int(y1 * scale_factor), 
-            int(x2 * scale_factor),
-            int(y2 * scale_factor)
-        )
-    
     def preprocess_image_pil(self, image_pil: Image.Image) -> Image.Image:
-        """Preprocess image using PIL (fallback method)"""
+        """Preprocess image using PIL"""
         try:
             # Convert to grayscale
             gray = image_pil.convert('L')
@@ -71,7 +49,6 @@ class PDFExtractor:
             
             return sharpened
         except Exception as e:
-            st.warning(f"PIL preprocessing failed: {e}")
             return image_pil.convert('L')
     
     def preprocess_image_cv2(self, image: np.ndarray) -> np.ndarray:
@@ -89,25 +66,23 @@ class PDFExtractor:
             )
             
             return adaptive_thresh
-        except Exception as e:
-            st.warning(f"OpenCV preprocessing failed: {e}")
+        except Exception:
             return image
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Preprocess image for better OCR accuracy with fallback methods"""
-        if cv2 is not None:
-            try:
-                return self.preprocess_image_cv2(image)
-            except Exception as e:
-                st.warning(f"OpenCV preprocessing failed, using PIL: {e}")
+        """Preprocess image for better OCR accuracy"""
+        # Try OpenCV first
+        try:
+            return self.preprocess_image_cv2(image)
+        except Exception:
+            pass
         
         # Fallback to PIL
         try:
             image_pil = Image.fromarray(image)
             processed_pil = self.preprocess_image_pil(image_pil)
             return np.array(processed_pil)
-        except Exception as e:
-            st.warning(f"All preprocessing failed: {e}")
+        except Exception:
             return image
     
     def extract_field_value(self, image: np.ndarray, coordinates: Tuple[int, int, int, int], field_name: str) -> str:
@@ -137,10 +112,10 @@ class PDFExtractor:
         
         # Configure OCR based on field type
         if any(keyword in field_name.lower() for keyword in ['coverage', 'rent', 'total']):
-            # For monetary amounts - more specific whitelist
+            # For monetary amounts
             config = '--psm 8 -c tessedit_char_whitelist=0123456789.,$'
         elif 'location' in field_name.lower() or 'description' in field_name.lower():
-            # For addresses - allow more characters
+            # For addresses
             config = '--psm 6'
         else:
             # General text
@@ -153,19 +128,14 @@ class PDFExtractor:
             # Clean up the text based on field type
             if any(keyword in field_name.lower() for keyword in ['coverage', 'rent', 'total']):
                 # For monetary amounts
-                # Remove everything except digits, decimal points, and commas
                 text = re.sub(r'[^\d.,]', '', text)
-                # Remove leading/trailing commas or dots
                 text = text.strip('.,')
-                # Handle multiple decimal points
                 if text.count('.') > 1:
                     parts = text.split('.')
-                    text = '.'.join(parts[:2])  # Keep only first decimal point
+                    text = '.'.join(parts[:2])
             elif 'location' in field_name.lower() or 'description' in field_name.lower():
-                # For location/description - clean up but preserve address format
-                # Remove excessive whitespace and line breaks
+                # For location/description
                 text = ' '.join(text.split())
-                # Remove common OCR artifacts
                 text = re.sub(r'[|_\\]', '', text)
             
             return text if text else f"No text detected in {field_name}"
@@ -173,27 +143,20 @@ class PDFExtractor:
         except Exception as e:
             return f"OCR error in {field_name}: {str(e)}"
     
-    def process_pdf(self, pdf_file) -> Dict[str, str]:
-        """Process a single PDF file"""
+    def process_pdf_from_bytes(self, pdf_bytes: bytes, filename: str) -> Dict[str, str]:
+        """Process PDF from bytes"""
         try:
             # Convert PDF to images at extraction DPI
-            if hasattr(pdf_file, 'read'):
-                # Streamlit uploaded file
-                pdf_bytes = pdf_file.read()
-                images = convert_from_bytes(pdf_bytes, dpi=self.extraction_dpi)
-            else:
-                # File path
-                images = convert_from_path(pdf_file, dpi=self.extraction_dpi)
+            images = convert_from_bytes(pdf_bytes, dpi=self.extraction_dpi)
             
-            # Process first page
             if not images:
-                return {"error": "No pages found in PDF"}
+                return {"error": "No pages found in PDF", "filename": filename}
             
             # Convert PIL image to numpy array
             image_np = np.array(images[0])
             
             # Extract all fields
-            extracted_data = {}
+            extracted_data = {"filename": filename}
             for field_name, coordinates in self.field_coordinates.items():
                 value = self.extract_field_value(image_np, coordinates, field_name)
                 extracted_data[field_name] = value
@@ -201,7 +164,78 @@ class PDFExtractor:
             return extracted_data
             
         except Exception as e:
-            return {"error": f"Error processing PDF: {str(e)}"}
+            return {"error": f"Error processing PDF: {str(e)}", "filename": filename}
+    
+    def process_pdf(self, pdf_file) -> Dict[str, str]:
+        """Process a single PDF file"""
+        try:
+            if hasattr(pdf_file, 'read'):
+                # Streamlit uploaded file
+                pdf_bytes = pdf_file.read()
+                filename = pdf_file.name
+            else:
+                # File path
+                with open(pdf_file, 'rb') as f:
+                    pdf_bytes = f.read()
+                filename = os.path.basename(pdf_file)
+            
+            return self.process_pdf_from_bytes(pdf_bytes, filename)
+            
+        except Exception as e:
+            return {"error": f"Error processing PDF: {str(e)}", "filename": getattr(pdf_file, 'name', 'unknown')}
+    
+    def extract_pdfs_from_zip(self, zip_file) -> List[Tuple[str, bytes]]:
+        """Extract PDF files from ZIP archive"""
+        pdf_files = []
+        
+        try:
+            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                for file_info in zip_ref.filelist:
+                    if file_info.filename.lower().endswith('.pdf') and not file_info.filename.startswith('__MACOSX'):
+                        pdf_bytes = zip_ref.read(file_info.filename)
+                        # Clean filename
+                        filename = os.path.basename(file_info.filename)
+                        pdf_files.append((filename, pdf_bytes))
+                        
+        except Exception as e:
+            st.error(f"Error extracting ZIP file: {str(e)}")
+            
+        return pdf_files
+    
+    def process_zip_file(self, zip_file) -> pd.DataFrame:
+        """Process ZIP file containing PDFs"""
+        # Extract PDFs from ZIP
+        pdf_files = self.extract_pdfs_from_zip(zip_file)
+        
+        if not pdf_files:
+            st.error("No PDF files found in ZIP archive")
+            return pd.DataFrame()
+        
+        st.success(f"Found {len(pdf_files)} PDF files in ZIP archive")
+        
+        results = []
+        progress_bar = st.progress(0)
+        
+        for i, (filename, pdf_bytes) in enumerate(pdf_files):
+            st.write(f"Processing: {filename}")
+            
+            # Process PDF
+            extracted_data = self.process_pdf_from_bytes(pdf_bytes, filename)
+            results.append(extracted_data)
+            
+            # Update progress
+            progress_bar.progress((i + 1) / len(pdf_files))
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(results)
+        
+        # Reorder columns
+        desired_order = ['filename', 'property_coverage', 'loss_of_rent', 'total', 'location_description']
+        existing_cols = [col for col in desired_order if col in df.columns]
+        other_cols = [col for col in df.columns if col not in desired_order]
+        df = df[existing_cols + other_cols]
+        
+        return df
     
     def process_multiple_pdfs(self, pdf_files: List) -> pd.DataFrame:
         """Process multiple PDF files"""
@@ -213,9 +247,6 @@ class PDFExtractor:
             
             # Extract data from PDF
             extracted_data = self.process_pdf(pdf_file)
-            
-            # Add filename to results
-            extracted_data['filename'] = pdf_file.name
             results.append(extracted_data)
             
             # Update progress
@@ -291,12 +322,12 @@ def get_field_coordinates_from_sidebar():
     return coordinates
 
 def draw_rectangles_safe(image_np, field_coordinates, preview_dpi=200):
-    """Safely draw rectangles with DPI scaling for preview"""
+    """Draw rectangles with DPI scaling for preview"""
     # Scale coordinates from 300 DPI (extraction) to preview DPI
     scaled_coordinates = {}
     for field_name, coords in field_coordinates.items():
         x1, y1, x2, y2 = coords
-        scale_factor = preview_dpi / 300  # Scale from 300 DPI to preview DPI
+        scale_factor = preview_dpi / 300
         scaled_coordinates[field_name] = (
             int(x1 * scale_factor),
             int(y1 * scale_factor),
@@ -304,64 +335,53 @@ def draw_rectangles_safe(image_np, field_coordinates, preview_dpi=200):
             int(y2 * scale_factor)
         )
     
-    if cv2 is not None:
-        try:
-            # Use OpenCV
-            colors = {
-                'property_coverage': (255, 0, 0),      # Red
-                'loss_of_rent': (0, 255, 0),          # Green
-                'total': (0, 0, 255),                 # Blue
-                'location_description': (255, 255, 0)  # Yellow
-            }
-            
-            for field_name, (x1, y1, x2, y2) in scaled_coordinates.items():
-                color = colors.get(field_name, (255, 0, 0))
-                cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 3)
-                
-                # Add field label
-                label = field_name.replace('_', ' ').title()
-                cv2.putText(image_np, label, (x1, y1-10), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            return image_np
-        except Exception as e:
-            st.warning(f"OpenCV drawing failed: {e}")
-    
-    # Fallback: use PIL
     try:
-        from PIL import ImageDraw, ImageFont
-        
-        image_pil = Image.fromarray(image_np)
-        draw = ImageDraw.Draw(image_pil)
-        
+        # Use OpenCV
         colors = {
             'property_coverage': (255, 0, 0),      # Red
-            'loss_of_rent': (0, 255, 0),          # Green  
+            'loss_of_rent': (0, 255, 0),          # Green
             'total': (0, 0, 255),                 # Blue
             'location_description': (255, 255, 0)  # Yellow
         }
         
         for field_name, (x1, y1, x2, y2) in scaled_coordinates.items():
             color = colors.get(field_name, (255, 0, 0))
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+            cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 3)
             
             # Add field label
             label = field_name.replace('_', ' ').title()
-            draw.text((x1, y1-20), label, fill=color)
-        
-        return np.array(image_pil)
-    except Exception as e:
-        st.error(f"Both OpenCV and PIL drawing failed: {e}")
+            cv2.putText(image_np, label, (x1, y1-10), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         return image_np
+    except Exception:
+        # Fallback: use PIL
+        try:
+            from PIL import ImageDraw
+            
+            image_pil = Image.fromarray(image_np)
+            draw = ImageDraw.Draw(image_pil)
+            
+            colors = {
+                'property_coverage': (255, 0, 0),
+                'loss_of_rent': (0, 255, 0),
+                'total': (0, 0, 255),
+                'location_description': (255, 255, 0)
+            }
+            
+            for field_name, (x1, y1, x2, y2) in scaled_coordinates.items():
+                color = colors.get(field_name, (255, 0, 0))
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+                
+                label = field_name.replace('_', ' ').title()
+                draw.text((x1, y1-20), label, fill=color)
+            
+            return np.array(image_pil)
+        except Exception:
+            return image_np
 
 def main():
     st.title("📄 Insurance Document Data Extractor")
     st.markdown("Upload scanned PDF insurance documents to extract key information")
-    
-    # Show OpenCV status
-    if cv2 is None:
-        st.warning("⚠️ OpenCV not fully available. Using PIL fallback for image processing.")
-    else:
-        st.success("✅ OpenCV loaded successfully")
     
     # Get field coordinates from sidebar
     field_coordinates = get_field_coordinates_from_sidebar()
@@ -373,7 +393,7 @@ def main():
     - **Preview tab shows 200 DPI** (for speed)
     - **Extraction uses 300 DPI** (for accuracy)
     - Coordinates auto-scale between preview/extraction
-    - Look for the colored boxes in preview
+    - Upload individual PDFs or ZIP file containing PDFs
     - Property Coverage: Red box
     - Loss of Rent: Green box  
     - Total: Blue box
@@ -384,65 +404,154 @@ def main():
     tab1, tab2, tab3 = st.tabs(["📤 Upload & Extract", "🔍 Preview", "📊 Results"])
     
     with tab1:
-        st.header("Upload PDF Files")
-        uploaded_files = st.file_uploader(
-            "Choose PDF files",
-            type=['pdf'],
-            accept_multiple_files=True,
-            help="Upload one or more PDF files with identical layouts"
+        st.header("Upload Files")
+        
+        # File upload options
+        upload_option = st.radio(
+            "Choose upload method:",
+            ["📄 Individual PDF Files", "📦 ZIP File containing PDFs"],
+            horizontal=True
         )
         
-        if uploaded_files:
-            st.success(f"Uploaded {len(uploaded_files)} file(s)")
+        if upload_option == "📄 Individual PDF Files":
+            uploaded_files = st.file_uploader(
+                "Choose PDF files",
+                type=['pdf'],
+                accept_multiple_files=True,
+                help="Upload one or more PDF files with identical layouts"
+            )
             
-            # Show current coordinates
-            with st.expander("📐 Current Coordinates (300 DPI)", expanded=False):
-                coord_df = pd.DataFrame([
-                    {"Field": "Property Coverage", "X1": field_coordinates['property_coverage'][0], 
-                     "Y1": field_coordinates['property_coverage'][1], "X2": field_coordinates['property_coverage'][2], 
-                     "Y2": field_coordinates['property_coverage'][3]},
-                    {"Field": "Loss of Rent", "X1": field_coordinates['loss_of_rent'][0], 
-                     "Y1": field_coordinates['loss_of_rent'][1], "X2": field_coordinates['loss_of_rent'][2], 
-                     "Y2": field_coordinates['loss_of_rent'][3]},
-                    {"Field": "Total", "X1": field_coordinates['total'][0], 
-                     "Y1": field_coordinates['total'][1], "X2": field_coordinates['total'][2], 
-                     "Y2": field_coordinates['total'][3]},
-                    {"Field": "Location/Description", "X1": field_coordinates['location_description'][0], 
-                     "Y1": field_coordinates['location_description'][1], "X2": field_coordinates['location_description'][2], 
-                     "Y2": field_coordinates['location_description'][3]}
-                ])
-                st.dataframe(coord_df, hide_index=True)
+            if uploaded_files:
+                st.success(f"Uploaded {len(uploaded_files)} PDF file(s)")
+                
+                # Show current coordinates
+                with st.expander("📐 Current Coordinates (300 DPI)", expanded=False):
+                    coord_df = pd.DataFrame([
+                        {"Field": "Property Coverage", "X1": field_coordinates['property_coverage'][0], 
+                         "Y1": field_coordinates['property_coverage'][1], "X2": field_coordinates['property_coverage'][2], 
+                         "Y2": field_coordinates['property_coverage'][3]},
+                        {"Field": "Loss of Rent", "X1": field_coordinates['loss_of_rent'][0], 
+                         "Y1": field_coordinates['loss_of_rent'][1], "X2": field_coordinates['loss_of_rent'][2], 
+                         "Y2": field_coordinates['loss_of_rent'][3]},
+                        {"Field": "Total", "X1": field_coordinates['total'][0], 
+                         "Y1": field_coordinates['total'][1], "X2": field_coordinates['total'][2], 
+                         "Y2": field_coordinates['total'][3]},
+                        {"Field": "Location/Description", "X1": field_coordinates['location_description'][0], 
+                         "Y1": field_coordinates['location_description'][1], "X2": field_coordinates['location_description'][2], 
+                         "Y2": field_coordinates['location_description'][3]}
+                    ])
+                    st.dataframe(coord_df, hide_index=True)
+                
+                # Extract button
+                if st.button("🚀 Extract Data from PDFs", type="primary"):
+                    extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
+                    
+                    with st.spinner("Processing PDF files..."):
+                        results_df = extractor.process_multiple_pdfs(uploaded_files)
+                    
+                    # Store results in session state
+                    st.session_state['results_df'] = results_df
+                    st.success("✅ Extraction completed!")
+                    
+                    # Show preview
+                    st.subheader("📋 Extraction Results")
+                    st.dataframe(results_df, use_container_width=True)
+                    
+                    # Download button
+                    csv_data = results_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv_data,
+                        file_name="extracted_insurance_data.csv",
+                        mime="text/csv"
+                    )
+        
+        else:  # ZIP file option
+            uploaded_zip = st.file_uploader(
+                "Choose ZIP file containing PDFs",
+                type=['zip'],
+                help="Upload a ZIP file containing PDF documents with identical layouts"
+            )
             
-            # Extract button
-            if st.button("🚀 Extract Data", type="primary"):
-                extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
+            if uploaded_zip:
+                st.success(f"Uploaded ZIP file: {uploaded_zip.name}")
                 
-                with st.spinner("Processing PDFs..."):
-                    results_df = extractor.process_multiple_pdfs(uploaded_files)
+                # Show current coordinates
+                with st.expander("📐 Current Coordinates (300 DPI)", expanded=False):
+                    coord_df = pd.DataFrame([
+                        {"Field": "Property Coverage", "X1": field_coordinates['property_coverage'][0], 
+                         "Y1": field_coordinates['property_coverage'][1], "X2": field_coordinates['property_coverage'][2], 
+                         "Y2": field_coordinates['property_coverage'][3]},
+                        {"Field": "Loss of Rent", "X1": field_coordinates['loss_of_rent'][0], 
+                         "Y1": field_coordinates['loss_of_rent'][1], "X2": field_coordinates['loss_of_rent'][2], 
+                         "Y2": field_coordinates['loss_of_rent'][3]},
+                        {"Field": "Total", "X1": field_coordinates['total'][0], 
+                         "Y1": field_coordinates['total'][1], "X2": field_coordinates['total'][2], 
+                         "Y2": field_coordinates['total'][3]},
+                        {"Field": "Location/Description", "X1": field_coordinates['location_description'][0], 
+                         "Y1": field_coordinates['location_description'][1], "X2": field_coordinates['location_description'][2], 
+                         "Y2": field_coordinates['location_description'][3]}
+                    ])
+                    st.dataframe(coord_df, hide_index=True)
                 
-                # Store results in session state
-                st.session_state['results_df'] = results_df
-                st.success("✅ Extraction completed!")
-                
-                # Show preview
-                st.subheader("📋 Extraction Results")
-                st.dataframe(results_df, use_container_width=True)
-                
-                # Download button
-                csv_data = results_df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv_data,
-                    file_name="extracted_insurance_data.csv",
-                    mime="text/csv"
-                )
+                # Extract button
+                if st.button("🚀 Extract Data from ZIP", type="primary"):
+                    extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
+                    
+                    with st.spinner("Processing ZIP file..."):
+                        results_df = extractor.process_zip_file(uploaded_zip)
+                    
+                    if not results_df.empty:
+                        # Store results in session state
+                        st.session_state['results_df'] = results_df
+                        st.success("✅ Extraction completed!")
+                        
+                        # Show preview
+                        st.subheader("📋 Extraction Results")
+                        st.dataframe(results_df, use_container_width=True)
+                        
+                        # Download button
+                        csv_data = results_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download CSV",
+                            data=csv_data,
+                            file_name="extracted_insurance_data.csv",
+                            mime="text/csv"
+                        )
     
     with tab2:
         st.header("🔍 Preview Extraction Areas")
         st.info("Preview shows coordinates scaled to 200 DPI for faster loading")
         
-        if uploaded_files:
-            selected_file = st.selectbox("Select file to preview", uploaded_files, key="preview_file")
+        # Check for uploaded files
+        uploaded_files = None
+        if 'uploaded_files' in locals():
+            files_to_preview = uploaded_files
+        elif 'uploaded_zip' in locals() and uploaded_zip:
+            # Extract one PDF from ZIP for preview
+            extractor = PDFExtractor(field_coordinates)
+            pdf_files = extractor.extract_pdfs_from_zip(uploaded_zip)
+            if pdf_files:
+                # Create a mock file object for preview
+                class MockFile:
+                    def __init__(self, name, content):
+                        self.name = name
+                        self.content = content
+                    def read(self):
+                        return self.content
+                
+                files_to_preview = [MockFile(name, content) for name, content in pdf_files[:1]]
+            else:
+                files_to_preview = None
+        else:
+            files_to_preview = None
+        
+        if files_to_preview:
+            if len(files_to_preview) == 1:
+                selected_file = files_to_preview[0]
+            else:
+                selected_file = st.selectbox("Select file to preview", files_to_preview, 
+                                           format_func=lambda x: x.name, key="preview_file")
             
             col1, col2 = st.columns([2, 1])
             
@@ -457,7 +566,6 @@ def main():
                 **Current 300 DPI Coordinates:**
                 """)
                 
-                # Show scaled coordinates for 200 DPI preview
                 st.text(f"Property: {field_coordinates['property_coverage']}")
                 st.text(f"Loss Rent: {field_coordinates['loss_of_rent']}")  
                 st.text(f"Total: {field_coordinates['total']}")
@@ -482,7 +590,7 @@ def main():
                             # Show extracted values using actual extraction coordinates
                             st.subheader("🔍 Extracted Values Preview")
                             extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
-                            extracted = extractor.process_pdf(selected_file)
+                            extracted = extractor.process_pdf_from_bytes(pdf_bytes, selected_file.name)
                             
                             if 'error' not in extracted:
                                 preview_df = pd.DataFrame([extracted])
@@ -493,7 +601,7 @@ def main():
                     except Exception as e:
                         st.error(f"Error previewing file: {str(e)}")
         else:
-            st.info("Upload a PDF file first to see the preview")
+            st.info("Upload PDF files or a ZIP file first to see the preview")
     
     with tab3:
         st.header("📊 Results Analysis")
