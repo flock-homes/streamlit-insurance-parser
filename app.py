@@ -22,7 +22,7 @@ st.set_page_config(
 # Default field coordinates (you'll need to calibrate these)
 DEFAULT_COORDINATES = {
     'property_coverage': (430, 1150, 700, 1180),
-    'loss_of_rent': (430, 1280, 700, 1238),
+    'loss_of_rent': (430, 1208, 700, 1238),
     'total': (353, 1547, 653, 1577),
     'location_description': (150, 800, 700, 870)
 }
