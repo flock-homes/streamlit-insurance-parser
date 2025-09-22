@@ -30,7 +30,7 @@ st.set_page_config(
 # Updated coordinates based on your document layout (at 300 DPI)
 DEFAULT_COORDINATES = {
     'property_coverage': (645, 1725, 1050, 1770),    # Red box - $261,783.00
-    'loss_of_rent': (645, 1965, 1050, 2010),        # Green box - $22,800.00  
+    'loss_of_rent': (645, 1810, 1050, 1855),        # Green box - $22,800.00  
     'total': (530, 2320, 830, 2365),                # Blue box - $945.59
     'location_description': (225, 1200, 1050, 1290) # Yellow box - address area
 }
