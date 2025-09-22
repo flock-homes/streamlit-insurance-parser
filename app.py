@@ -383,6 +383,14 @@ def main():
     st.title("📄 Insurance Document Data Extractor")
     st.markdown("Upload scanned PDF insurance documents to extract key information")
     
+    # Initialize session state
+    if 'uploaded_files' not in st.session_state:
+        st.session_state.uploaded_files = None
+    if 'uploaded_zip' not in st.session_state:
+        st.session_state.uploaded_zip = None
+    if 'upload_method' not in st.session_state:
+        st.session_state.upload_method = "📄 Individual PDF Files"
+    
     # Get field coordinates from sidebar
     field_coordinates = get_field_coordinates_from_sidebar()
     
@@ -413,6 +421,9 @@ def main():
             horizontal=True
         )
         
+        # Store upload method in session state
+        st.session_state.upload_method = upload_option
+        
         if upload_option == "📄 Individual PDF Files":
             uploaded_files = st.file_uploader(
                 "Choose PDF files",
@@ -421,8 +432,13 @@ def main():
                 help="Upload one or more PDF files with identical layouts"
             )
             
+            # Store in session state
             if uploaded_files:
-                st.success(f"Uploaded {len(uploaded_files)} PDF file(s)")
+                st.session_state.uploaded_files = uploaded_files
+                st.session_state.uploaded_zip = None  # Clear ZIP if PDFs uploaded
+            
+            if st.session_state.uploaded_files:
+                st.success(f"Uploaded {len(st.session_state.uploaded_files)} PDF file(s)")
                 
                 # Show current coordinates
                 with st.expander("📐 Current Coordinates (300 DPI)", expanded=False):
@@ -447,7 +463,7 @@ def main():
                     extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
                     
                     with st.spinner("Processing PDF files..."):
-                        results_df = extractor.process_multiple_pdfs(uploaded_files)
+                        results_df = extractor.process_multiple_pdfs(st.session_state.uploaded_files)
                     
                     # Store results in session state
                     st.session_state['results_df'] = results_df
@@ -473,8 +489,13 @@ def main():
                 help="Upload a ZIP file containing PDF documents with identical layouts"
             )
             
+            # Store in session state
             if uploaded_zip:
-                st.success(f"Uploaded ZIP file: {uploaded_zip.name}")
+                st.session_state.uploaded_zip = uploaded_zip
+                st.session_state.uploaded_files = None  # Clear PDFs if ZIP uploaded
+            
+            if st.session_state.uploaded_zip:
+                st.success(f"Uploaded ZIP file: {st.session_state.uploaded_zip.name}")
                 
                 # Show current coordinates
                 with st.expander("📐 Current Coordinates (300 DPI)", expanded=False):
@@ -499,7 +520,7 @@ def main():
                     extractor = PDFExtractor(field_coordinates, extraction_dpi=300)
                     
                     with st.spinner("Processing ZIP file..."):
-                        results_df = extractor.process_zip_file(uploaded_zip)
+                        results_df = extractor.process_zip_file(st.session_state.uploaded_zip)
                     
                     if not results_df.empty:
                         # Store results in session state
@@ -523,14 +544,16 @@ def main():
         st.header("🔍 Preview Extraction Areas")
         st.info("Preview shows coordinates scaled to 200 DPI for faster loading")
         
-        # Check for uploaded files
-        uploaded_files = None
-        if 'uploaded_files' in locals():
-            files_to_preview = uploaded_files
-        elif 'uploaded_zip' in locals() and uploaded_zip:
+        # Get files from session state
+        files_to_preview = None
+        
+        if st.session_state.upload_method == "📄 Individual PDF Files" and st.session_state.uploaded_files:
+            files_to_preview = st.session_state.uploaded_files
+            
+        elif st.session_state.upload_method == "📦 ZIP File containing PDFs" and st.session_state.uploaded_zip:
             # Extract one PDF from ZIP for preview
             extractor = PDFExtractor(field_coordinates)
-            pdf_files = extractor.extract_pdfs_from_zip(uploaded_zip)
+            pdf_files = extractor.extract_pdfs_from_zip(st.session_state.uploaded_zip)
             if pdf_files:
                 # Create a mock file object for preview
                 class MockFile:
@@ -540,19 +563,9 @@ def main():
                     def read(self):
                         return self.content
                 
-                files_to_preview = [MockFile(name, content) for name, content in pdf_files[:1]]
-            else:
-                files_to_preview = None
-        else:
-            files_to_preview = None
+                files_to_preview = [MockFile(name, content) for name, content in pdf_files[:3]]  # Show up to 3 files
         
         if files_to_preview:
-            if len(files_to_preview) == 1:
-                selected_file = files_to_preview[0]
-            else:
-                selected_file = st.selectbox("Select file to preview", files_to_preview, 
-                                           format_func=lambda x: x.name, key="preview_file")
-            
             col1, col2 = st.columns([2, 1])
             
             with col2:
@@ -570,9 +583,20 @@ def main():
                 st.text(f"Loss Rent: {field_coordinates['loss_of_rent']}")  
                 st.text(f"Total: {field_coordinates['total']}")
                 st.text(f"Location: {field_coordinates['location_description']}")
+                
+                # File selector
+                if len(files_to_preview) > 1:
+                    selected_file = st.selectbox(
+                        "Select file to preview:", 
+                        files_to_preview, 
+                        format_func=lambda x: x.name
+                    )
+                else:
+                    selected_file = files_to_preview[0]
+                    st.write(f"**Previewing:** {selected_file.name}")
             
             with col1:
-                if selected_file and st.button("👁️ Show Extraction Areas"):
+                if st.button("👁️ Show Extraction Areas"):
                     try:
                         # Convert first page to image at 200 DPI for preview
                         pdf_bytes = selected_file.read()
@@ -602,6 +626,14 @@ def main():
                         st.error(f"Error previewing file: {str(e)}")
         else:
             st.info("Upload PDF files or a ZIP file first to see the preview")
+            
+            # Show what's currently uploaded
+            if st.session_state.uploaded_files:
+                st.write(f"✅ {len(st.session_state.uploaded_files)} PDF files uploaded")
+            elif st.session_state.uploaded_zip:
+                st.write(f"✅ ZIP file uploaded: {st.session_state.uploaded_zip.name}")
+            else:
+                st.write("❌ No files uploaded yet")
     
     with tab3:
         st.header("📊 Results Analysis")
