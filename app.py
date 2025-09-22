@@ -21,10 +21,10 @@ st.set_page_config(
 
 # Default field coordinates (you'll need to calibrate these)
 DEFAULT_COORDINATES = {
-    'property_coverage': (450, 580, 600, 610),
-    'loss_of_rent': (450, 620, 600, 650),
-    'total': (850, 750, 950, 780),
-    'location_description': (200, 450, 700, 480)
+    'property_coverage': (430, 1150, 700, 1180),
+    'loss_of_rent': (430, 1280, 700, 1238),
+    'total': (353, 1547, 653, 1577),
+    'location_description': (150, 800, 700, 870)
 }
 
 class PDFExtractor:
