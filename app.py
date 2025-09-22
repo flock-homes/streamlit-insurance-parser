@@ -1,10 +1,18 @@
 import streamlit as st
-import cv2
+try:
+    import cv2
+    # Test if cv2 is working properly
+    _ = cv2.MORPH_OPENING
+except (ImportError, AttributeError) as e:
+    st.error(f"OpenCV issue detected: {e}")
+    st.info("Using alternative image processing...")
+    cv2 = None
+
 import pytesseract
 from pdf2image import convert_from_path, convert_from_bytes
 import pandas as pd
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 import io
 import zipfile
 import tempfile
@@ -21,10 +29,10 @@ st.set_page_config(
 
 # Default field coordinates (you'll need to calibrate these)
 DEFAULT_COORDINATES = {
-    'property_coverage': (430, 1150, 700, 1180),
-    'loss_of_rent': (430, 1208, 700, 1238),
-    'total': (353, 1547, 653, 1577),
-    'location_description': (150, 800, 700, 870)
+    'property_coverage': (450, 580, 600, 610),
+    'loss_of_rent': (450, 620, 600, 650),
+    'total': (850, 750, 950, 780),
+    'location_description': (200, 450, 700, 480)
 }
 
 class PDFExtractor:
@@ -32,29 +40,91 @@ class PDFExtractor:
         self.results = []
         self.field_coordinates = field_coordinates
     
+    def preprocess_image_pil(self, image_pil: Image.Image) -> Image.Image:
+        """Preprocess image using PIL (fallback method)"""
+        try:
+            # Convert to grayscale
+            gray = image_pil.convert('L')
+            
+            # Enhance contrast
+            enhancer = ImageEnhance.Contrast(gray)
+            enhanced = enhancer.enhance(2.0)
+            
+            # Apply threshold (convert to binary)
+            threshold = 128
+            binary = enhanced.point(lambda p: 255 if p > threshold else 0, mode='1')
+            
+            return binary.convert('L')
+        except Exception as e:
+            st.warning(f"PIL preprocessing failed: {e}")
+            return image_pil.convert('L')
+    
+    def preprocess_image_cv2(self, image: np.ndarray) -> np.ndarray:
+        """Preprocess image using OpenCV"""
+        try:
+            # Convert to grayscale if needed
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image
+            
+            # Apply thresholding
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Noise removal - use direct values instead of constants
+            kernel = np.ones((2, 2), np.uint8)
+            
+            # MORPH_OPENING = 2 (if constant not available)
+            try:
+                opening = cv2.morphologyEx(thresh, cv2.MORPH_OPENING, kernel, iterations=1)
+            except AttributeError:
+                # Fallback: opening = erosion followed by dilation
+                erosion = cv2.erode(thresh, kernel, iterations=1)
+                opening = cv2.dilate(erosion, kernel, iterations=1)
+            
+            return opening
+        except Exception as e:
+            st.warning(f"OpenCV preprocessing failed: {e}")
+            return image
+    
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Preprocess image for better OCR accuracy"""
-        # Convert to grayscale if needed
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = image
+        """Preprocess image for better OCR accuracy with fallback methods"""
+        if cv2 is not None:
+            try:
+                return self.preprocess_image_cv2(image)
+            except Exception as e:
+                st.warning(f"OpenCV preprocessing failed, using PIL: {e}")
         
-        # Apply thresholding
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Noise removal
-        kernel = np.ones((1, 1), np.uint8)
-        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPENING, kernel, iterations=1)
-        
-        return opening
+        # Fallback to PIL
+        try:
+            image_pil = Image.fromarray(image)
+            processed_pil = self.preprocess_image_pil(image_pil)
+            return np.array(processed_pil)
+        except Exception as e:
+            st.warning(f"All preprocessing failed: {e}")
+            return image
     
     def extract_field_value(self, image: np.ndarray, coordinates: Tuple[int, int, int, int], field_name: str) -> str:
         """Extract text from specific coordinates"""
         x1, y1, x2, y2 = coordinates
         
+        # Validate coordinates
+        if x1 >= x2 or y1 >= y2:
+            return f"Invalid coordinates for {field_name}"
+        
+        # Ensure coordinates are within image bounds
+        h, w = image.shape[:2]
+        x1, x2 = max(0, min(x1, w)), max(0, min(x2, w))
+        y1, y2 = max(0, min(y1, h)), max(0, min(y2, h))
+        
+        if x1 >= x2 or y1 >= y2:
+            return f"Coordinates out of bounds for {field_name}"
+        
         # Extract region of interest
         roi = image[y1:y2, x1:x2]
+        
+        if roi.size == 0:
+            return f"Empty ROI for {field_name}"
         
         # Preprocess ROI
         processed_roi = self.preprocess_image(roi)
@@ -62,7 +132,7 @@ class PDFExtractor:
         # Configure OCR based on field type
         if any(keyword in field_name.lower() for keyword in ['coverage', 'rent', 'total']):
             # For monetary amounts
-            config = '--psm 7 -c tessedit_char_whitelist=0123456789.,'
+            config = '--psm 7 -c tessedit_char_whitelist=0123456789.,$'
         else:
             # For addresses and text
             config = '--psm 6'
@@ -73,17 +143,18 @@ class PDFExtractor:
             
             # Clean up the text
             if any(keyword in field_name.lower() for keyword in ['coverage', 'rent', 'total']):
-                # Remove non-numeric characters except decimal points
-                text = re.sub(r'[^\d.]', '', text)
+                # Remove non-numeric characters except decimal points and commas
+                text = re.sub(r'[^\d.,]', '', text)
                 # Handle multiple decimal points
-                parts = text.split('.')
-                if len(parts) > 2:
-                    text = parts[0] + '.' + ''.join(parts[1:])
+                if '.' in text:
+                    parts = text.split('.')
+                    if len(parts) > 2:
+                        text = parts[0] + '.' + ''.join(parts[1:])
             
-            return text
+            return text if text else f"No text found in {field_name}"
+            
         except Exception as e:
-            st.error(f"Error extracting {field_name}: {str(e)}")
-            return ""
+            return f"OCR error in {field_name}: {str(e)}"
     
     def process_pdf(self, pdf_file) -> Dict[str, str]:
         """Process a single PDF file"""
@@ -190,13 +261,69 @@ def get_field_coordinates_from_sidebar():
     # Save coordinates button
     if st.sidebar.button("💾 Save Current Coordinates"):
         st.sidebar.success("Coordinates saved for this session!")
-        # You could add code here to save to a file or database
     
     return coordinates
+
+def draw_rectangles_safe(image_np, field_coordinates):
+    """Safely draw rectangles with fallback methods"""
+    if cv2 is not None:
+        try:
+            # Use OpenCV
+            colors = {
+                'property_coverage': (255, 0, 0),      # Red
+                'loss_of_rent': (0, 255, 0),          # Green
+                'total': (0, 0, 255),                 # Blue
+                'location_description': (255, 255, 0)  # Yellow
+            }
+            
+            for field_name, (x1, y1, x2, y2) in field_coordinates.items():
+                color = colors.get(field_name, (255, 0, 0))
+                cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 3)
+                
+                # Add field label
+                label = field_name.replace('_', ' ').title()
+                cv2.putText(image_np, label, (x1, y1-10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            return image_np
+        except Exception as e:
+            st.warning(f"OpenCV drawing failed: {e}")
+    
+    # Fallback: use PIL
+    try:
+        from PIL import ImageDraw, ImageFont
+        
+        image_pil = Image.fromarray(image_np)
+        draw = ImageDraw.Draw(image_pil)
+        
+        colors = {
+            'property_coverage': (255, 0, 0),      # Red
+            'loss_of_rent': (0, 255, 0),          # Green  
+            'total': (0, 0, 255),                 # Blue
+            'location_description': (255, 255, 0)  # Yellow
+        }
+        
+        for field_name, (x1, y1, x2, y2) in field_coordinates.items():
+            color = colors.get(field_name, (255, 0, 0))
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+            
+            # Add field label
+            label = field_name.replace('_', ' ').title()
+            draw.text((x1, y1-20), label, fill=color)
+        
+        return np.array(image_pil)
+    except Exception as e:
+        st.error(f"Both OpenCV and PIL drawing failed: {e}")
+        return image_np
 
 def main():
     st.title("📄 Insurance Document Data Extractor")
     st.markdown("Upload scanned PDF insurance documents to extract key information")
+    
+    # Show OpenCV status
+    if cv2 is None:
+        st.warning("⚠️ OpenCV not fully available. Using PIL fallback for image processing.")
+    else:
+        st.success("✅ OpenCV loaded successfully")
     
     # Get field coordinates from sidebar
     field_coordinates = get_field_coordinates_from_sidebar()
@@ -206,7 +333,7 @@ def main():
     st.sidebar.markdown("### 💡 Tips")
     st.sidebar.markdown("""
     - Use the **Preview** tab to see extraction areas
-    - Adjust coordinates if red boxes don't align with text
+    - Adjust coordinates if boxes don't align with text
     - X1,Y1 = top-left corner
     - X2,Y2 = bottom-right corner
     - Add 5-10 pixel buffer around text
@@ -296,26 +423,11 @@ def main():
                         if images:
                             image_np = np.array(images[0])
                             
-                            # Define colors for each field
-                            colors = {
-                                'property_coverage': (255, 0, 0),      # Red
-                                'loss_of_rent': (0, 255, 0),          # Green
-                                'total': (0, 0, 255),                 # Blue
-                                'location_description': (255, 255, 0)  # Yellow
-                            }
-                            
                             # Draw rectangles around extraction areas
-                            for field_name, (x1, y1, x2, y2) in field_coordinates.items():
-                                color = colors.get(field_name, (255, 0, 0))
-                                cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 3)
-                                
-                                # Add field label
-                                label = field_name.replace('_', ' ').title()
-                                cv2.putText(image_np, label, (x1, y1-10), 
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                            image_with_boxes = draw_rectangles_safe(image_np, field_coordinates)
                             
                             # Display image
-                            st.image(image_np, caption="Extraction Areas", use_column_width=True)
+                            st.image(image_with_boxes, caption="Extraction Areas", use_column_width=True)
                             
                             # Show extracted values
                             st.subheader("🔍 Extracted Values Preview")
@@ -388,16 +500,19 @@ def main():
                 )
             
             with col2:
-                excel_buffer = io.BytesIO()
-                df.to_excel(excel_buffer, index=False, engine='openpyxl')
-                excel_data = excel_buffer.getvalue()
-                
-                st.download_button(
-                    label="📊 Download as Excel",
-                    data=excel_data,
-                    file_name=f"insurance_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                try:
+                    excel_buffer = io.BytesIO()
+                    df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                    excel_data = excel_buffer.getvalue()
+                    
+                    st.download_button(
+                        label="📊 Download as Excel",
+                        data=excel_data,
+                        file_name=f"insurance_data_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                except Exception as e:
+                    st.error(f"Excel export not available: {e}")
             
         else:
             st.info("No results yet. Upload and process files in the Upload & Extract tab.")
